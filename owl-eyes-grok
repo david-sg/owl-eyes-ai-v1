@@ -1,0 +1,184 @@
+#include <avr/sleep.h>
+#include <avr/power.h>
+#include <avr/wdt.h>
+
+// === Uncomment to enable test mode (forces night + very active eyes) ===
+#define TEST_MODE
+
+// Pins
+const byte LEFT_LED  = 1;  // PB1 – physical pin 6 on ATtiny85
+const byte RIGHT_LED = 0;  // PB0 – physical pin 5 on ATtiny85
+const byte LDR_PIN   = A3;
+
+// Settings
+const byte LED_BRIGHTNESS = 255;
+const int NIGHT_THRESHOLD = 400;
+const byte BLINK_CHANCE = 15;
+const int ACTIVE_CYCLES = 1800; // ~4 hours with 8-second cycles
+
+volatile bool watchdogFired = false;
+bool nightStarted = false;
+int nightCounter = 0;
+
+// Watchdog interrupt
+ISR(WDT_vect) {
+  watchdogFired = true;
+}
+
+void setupWatchdog() {
+  MCUSR = 0;
+  WDTCR = _BV(WDCE) | _BV(WDE);
+  WDTCR = _BV(WDIE) | _BV(WDP3) | _BV(WDP0); // ~8s interval
+}
+
+void sleep8s() {
+  watchdogFired = false;
+  set_sleep_mode(SLEEP_MODE_PWR_DOWN);
+  sleep_enable();
+  power_adc_disable();
+  power_timer1_disable();
+  power_usi_disable();
+  sleep_cpu();
+  sleep_disable();
+  power_all_enable();
+}
+
+bool isNight() {
+#ifdef TEST_MODE
+  return true;
+#else
+  power_adc_enable();
+  int val = analogRead(LDR_PIN);
+  power_adc_disable();
+  return (val < NIGHT_THRESHOLD);
+#endif
+}
+
+// ────────────────────────────────────────────────
+// Owl eye animations – now end with both LEDs OFF
+// ────────────────────────────────────────────────
+
+void leftEye() {
+  analogWrite(RIGHT_LED, 0);
+  analogWrite(LEFT_LED, LED_BRIGHTNESS);
+  delay(400);
+  analogWrite(LEFT_LED, 0);
+  delay(120);               // short off – looks like a blink
+  analogWrite(LEFT_LED, LED_BRIGHTNESS);
+  delay(400);
+  analogWrite(LEFT_LED, 0); // end off
+}
+
+void rightEye() {
+  analogWrite(LEFT_LED, 0);
+  analogWrite(RIGHT_LED, LED_BRIGHTNESS);
+  delay(400);
+  analogWrite(RIGHT_LED, 0);
+  delay(120);
+  analogWrite(RIGHT_LED, LED_BRIGHTNESS);
+  delay(400);
+  analogWrite(RIGHT_LED, 0); // end off
+}
+
+void bothBlink() {
+  analogWrite(LEFT_LED, 0);
+  analogWrite(RIGHT_LED, 0);
+  delay(300);
+  analogWrite(LEFT_LED, LED_BRIGHTNESS);
+  analogWrite(RIGHT_LED, LED_BRIGHTNESS);
+  delay(400);
+  analogWrite(LEFT_LED, 0);
+  analogWrite(RIGHT_LED, 0); // end off
+}
+
+void combo() {
+  switch (random(6)) {
+    case 0: leftEye(); delay(300); rightEye(); break;
+    case 1: rightEye(); delay(300); leftEye(); break;
+    case 2: rightEye(); delay(200); bothBlink(); break;
+    case 3: leftEye(); delay(200); bothBlink(); break;
+    case 4: bothBlink(); delay(400); bothBlink(); break;
+    case 5: leftEye(); delay(300); rightEye(); delay(300); bothBlink(); break;
+  }
+}
+
+void setup() {
+  pinMode(LEFT_LED, OUTPUT);
+  pinMode(RIGHT_LED, OUTPUT);
+  pinMode(LDR_PIN, INPUT);
+
+  randomSeed(analogRead(2));  // noise from unconnected pin
+
+  setupWatchdog();
+
+  // Startup flash – both eyes full bright for 3 seconds
+  analogWrite(LEFT_LED, 255);
+  analogWrite(RIGHT_LED, 255);
+  delay(3000);
+  analogWrite(LEFT_LED, 0);
+  analogWrite(RIGHT_LED, 0);
+
+#ifdef TEST_MODE
+  // Extra lively startup in test mode
+  delay(600);
+  leftEye();
+  delay(800);
+  rightEye();
+  delay(800);
+  combo();
+  delay(1200);
+#endif
+}
+
+void loop() {
+  sleep8s();
+
+  bool night = isNight();
+
+  // Detect start of night
+  if (night && !nightStarted) {
+    nightStarted = true;
+    nightCounter = 0;
+
+#ifdef TEST_MODE
+    // Immediate lively sequence when night "starts" in test mode
+    combo();
+    delay(600);
+    leftEye();
+    delay(600);
+    bothBlink();
+    delay(1000);
+#endif
+  }
+
+  // Reset during day
+  if (!night) {
+    nightStarted = false;
+    analogWrite(LEFT_LED, 0);
+    analogWrite(RIGHT_LED, 0);
+    return;
+  }
+
+  // Limit activity to first ~4 hours of night
+  if (nightCounter > ACTIVE_CYCLES) return;
+  nightCounter++;
+
+  // Decide whether to animate this cycle
+#ifdef TEST_MODE
+  if (random(4) != 0) return;   // ~75% chance to animate
+#else
+  if (random(BLINK_CHANCE) != 0) return;
+#endif
+
+  // Choose random animation – slightly biased toward single eyes
+  int r = random(8);
+  if (r == 0) {
+    combo();
+  } else if (r <= 3) {
+    leftEye();      // 3/8 chance → more left-eye visibility
+  } else if (r <= 6) {
+    rightEye();     // 3/8 chance
+  } else {
+    bothBlink();    // 1/8 chance
+  }
+}
