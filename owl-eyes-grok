@@ -1,211 +1,247 @@
+// Owl Eyes - solar-aware, dark-active, lifelike fading eyes
+// Active dark period: ≈ 3 hours (8-second watchdog × 1350 cycles)
+// On reset: both eyes full ON for 5 seconds
+// Test mode: connect physical pin 7 (PB2 / digital pin 2) to GND at startup
+
 #include <avr/sleep.h>
 #include <avr/power.h>
 #include <avr/wdt.h>
 
-// === Uncomment to enable test mode (forces night + very active eyes) ===
-// #define TEST_MODE
-
-// Pins
-const byte LEFT_LED  = 1;  // PB1 – physical pin 6 on ATtiny85
-const byte RIGHT_LED = 0;  // PB0 – physical pin 5 on ATtiny85
-const byte LDR_PIN   = A3;
-
-// Settings
-const byte MAX_BRIGHTNESS = 255;
-const byte NORMAL_BRIGHT  = 100;     // softer for realism
-const int  NIGHT_THRESHOLD = 400;
-const byte BLINK_CHANCE    = 12;     // slightly more frequent than before
-const int  ACTIVE_CYCLES   = 1800;   // ~4 hours
-
-volatile bool watchdogFired = false;
-bool nightStarted = false;
-int nightCounter = 0;
-
-// Watchdog interrupt
-ISR(WDT_vect) {
-  watchdogFired = true;
-}
-
-void setupWatchdog() {
-  MCUSR = 0;
-  WDTCR = _BV(WDCE) | _BV(WDE);
-  WDTCR = _BV(WDIE) | _BV(WDP3) | _BV(WDP0); // ~8s interval
-}
-
-void sleep8s() {
-  watchdogFired = false;
-  set_sleep_mode(SLEEP_MODE_PWR_DOWN);
-  sleep_enable();
-  power_adc_disable();
-  power_timer1_disable();
-  power_usi_disable();
-  sleep_cpu();
-  sleep_disable();
-  power_all_enable();
-}
-
-bool isNight() {
-#ifdef TEST_MODE
-  return true;
-#else
-  power_adc_enable();
-  int val = analogRead(LDR_PIN);
-  power_adc_disable();
-  return (val < NIGHT_THRESHOLD);
+#ifndef cbi
+#define cbi(sfr, bit) (_SFR_BYTE(sfr) &= ~_BV(bit))
 #endif
-}
 
 // ────────────────────────────────────────────────
-// Smooth breathing (eyes "opening up" slowly)
-// durationMs ≈ time for full cycle (fade in + hold + fade out)
+//  CONFIG
 // ────────────────────────────────────────────────
-void breathing(byte pin, int durationMs = 4500, byte peakBright = 110) {
-  analogWrite(pin == LEFT_LED ? RIGHT_LED : LEFT_LED, 0);  // other eye off
+const int PIN_LEFT_EYE = 1;   // PB1 – physical pin 6
+const int PIN_RIGHT_EYE = 0;  // PB0 – physical pin 5
+const int PIN_SOLAR = A3;     // ADC3 – physical pin 2
+const int PIN_TEST_MODE = 2;  // PB2 – physical pin 7
 
-  int steps = 60;                    // smooth enough on 8-bit PWM
-  int fadeTime = durationMs / 3;     // ~1/3 fade in, 1/3 hold, 1/3 fade out
-  int stepDelay = fadeTime / steps;
+const int PWM_MAX_NORMAL = 85;  // 0–255
+const int PWM_MAX_LOW = 38;
 
-  // Fade in
-  for (int i = 0; i <= steps; i++) {
-    byte b = map(i, 0, steps, 0, peakBright);
-    analogWrite(pin, b);
-    delay(stepDelay);
-  }
+const long LOW_BATTERY_mV = 3350;       // start dimming
+const long CRITICAL_BATTERY_mV = 3150;  // eyes off completely
 
-  // Hold peak
-  delay(fadeTime);
+const float DAYLIGHT_THRESHOLD_V = 0.30f;  // original working value
 
-  // Fade out
-  for (int i = steps; i >= 0; i--) {
-    byte b = map(i, 0, steps, 0, peakBright);
-    analogWrite(pin, b);
-    delay(stepDelay);
-  }
+// ~8-second watchdog × 1350 ≈ 3 hours dark activity
+const long MAX_CYCLES = 1350;
+long cycle_counter = MAX_CYCLES;
 
-  analogWrite(pin, 0);  // ensure off
+// Fade timing (milliseconds)
+const int FADE_DURATION_MS = 3000;  // ~3 seconds ramp up/down
+const int SHORT_PAUSE_MS = 600;
+
+// Startup indicator duration
+const int STARTUP_ON_MS = 5000;  // 5 seconds full on at reset
+
+// ────────────────────────────────────────────────
+//  GLOBALS
+// ────────────────────────────────────────────────
+bool inTestMode = false;
+int pwmMax = PWM_MAX_NORMAL;
+
+long readBattery_mV() {
+  ADMUX = _BV(MUX3) | _BV(MUX2);  // 1.1V ref → measure Vcc
+  delay(2);
+  ADCSRA |= _BV(ADSC);
+  while (ADCSRA & _BV(ADSC))
+    ;
+  uint8_t low = ADCL, high = ADCH;
+  long val = (high << 8) | low;
+  return 1125300L / val;  // result in mV
 }
 
-// Quick single blink (realistic short eyelid close)
-void quickBlink(byte pin, byte bright = NORMAL_BRIGHT) {
-  analogWrite(pin == LEFT_LED ? RIGHT_LED : LEFT_LED, 0); // other off
-
-  analogWrite(pin, bright);
-  delay(80);
-  analogWrite(pin, 0);
-  delay(120);
-  analogWrite(pin, bright);
-  delay(200);
-  analogWrite(pin, 0);  // end off
+void setupWatchdog8s() {
+  noInterrupts();
+  MCUSR &= ~_BV(WDRF);
+  WDTCR = _BV(WDCE) | _BV(WDE);               // enable configuration change
+  WDTCR = _BV(WDIE) | _BV(WDP3) | _BV(WDP0);  // 8 seconds
+  interrupts();
+  wdt_reset();
 }
 
-// Synchronized blink (both eyes)
-void bothQuickBlink() {
-  analogWrite(LEFT_LED, 0);
-  analogWrite(RIGHT_LED, 0);
-  delay(100);
-
-  analogWrite(LEFT_LED, NORMAL_BRIGHT);
-  analogWrite(RIGHT_LED, NORMAL_BRIGHT);
-  delay(150);
-  analogWrite(LEFT_LED, 0);
-  analogWrite(RIGHT_LED, 0);
-}
-
-// Combo with mix of blinks & breathing
-void combo() {
-  int r = random(5);
-  if (r == 0) {
-    breathing(LEFT_LED,  random(3000, 6000));
-  } else if (r == 1) {
-    breathing(RIGHT_LED, random(3000, 6000));
-  } else if (r == 2) {
-    quickBlink(LEFT_LED); delay(400); quickBlink(RIGHT_LED);
-  } else if (r == 3) {
-    quickBlink(RIGHT_LED); delay(300); bothQuickBlink();
-  } else {
-    breathing(LEFT_LED, 3500, 90); delay(600);
-    breathing(RIGHT_LED, 4000, 100);
-  }
+ISR(WDT_vect) {
+  // watchdog wakes us – nothing else needed
 }
 
 void setup() {
-  pinMode(LEFT_LED, OUTPUT);
-  pinMode(RIGHT_LED, OUTPUT);
-  pinMode(LDR_PIN, INPUT);
+  setupWatchdog8s();
 
-  randomSeed(analogRead(2));
+  pinMode(PIN_LEFT_EYE, OUTPUT);
+  pinMode(PIN_RIGHT_EYE, OUTPUT);
+  pinMode(PIN_SOLAR, INPUT);  // MUST be INPUT for analogRead
+  pinMode(PIN_TEST_MODE, INPUT_PULLUP);
 
-  setupWatchdog();
+  // Startup indicator – both eyes full brightness for 5 seconds
+  analogWrite(PIN_LEFT_EYE, 255);
+  analogWrite(PIN_RIGHT_EYE, 255);
+  delay(STARTUP_ON_MS);
 
-  // Gentle startup – slow both-eye breath
-  breathing(LEFT_LED,  3000, 180);
-  breathing(RIGHT_LED, 3200, 180);
-  analogWrite(LEFT_LED, 0);
-  analogWrite(RIGHT_LED, 0);
-  delay(800);
+  // Fade off smoothly
+  fadeBothTo(0, 1200);
 
-#ifdef TEST_MODE
-  // Quick demo in test mode
-  breathing(LEFT_LED, 4000);
-  delay(800);
-  quickBlink(RIGHT_LED);
-  delay(800);
-  combo();
-#endif
-}
+  // Unused pins → OUTPUT LOW (skip PB3/A3!)
+  pinMode(4, OUTPUT);
+  digitalWrite(4, LOW);  // PB4 only
 
-void loop() {
-  sleep8s();
+  // Test mode detection
+  inTestMode = (digitalRead(PIN_TEST_MODE) == LOW);
 
-  bool night = isNight();
-
-  if (night && !nightStarted) {
-    nightStarted = true;
-    nightCounter = 0;
-
-#ifdef TEST_MODE
-    combo();
-    delay(800);
-    breathing(RIGHT_LED, 3800);
-    delay(1000);
-#endif
+  // Random seed
+  if (!inTestMode) {
+    randomSeed(analogRead(PIN_TEST_MODE) + (uint16_t)millis());
+  } else {
+    randomSeed(analogRead(0) ^ analogRead(1));
+    // Quick test mode confirmation
+    fadeBothTo(100, 300);
+    delay(150);
+    fadeBothTo(0, 300);
   }
 
-  if (!night) {
-    nightStarted = false;
-    analogWrite(LEFT_LED, 0);
-    analogWrite(RIGHT_LED, 0);
+  // Disable pull-ups explicitly (safe)
+  PORTB = 0x00;
+}
+
+void fadeTo(int pin, int target, int duration_ms) {
+  int start = 0;
+  if (start == target) {
+    digitalWrite(PIN_LEFT_EYE, LOW);
+    digitalWrite(PIN_RIGHT_EYE, LOW);
     return;
   }
 
-  if (nightCounter > ACTIVE_CYCLES) return;
-  nightCounter++;
+  int steps = max(10, duration_ms / 35);
+  int stepDelay = duration_ms / steps;
+  int delta = target - start;
 
-#ifdef TEST_MODE
-  if (random(3) == 0) return;   // ~66% animate chance → lively
-#else
-  if (random(BLINK_CHANCE) != 0) return;
-#endif
+  for (int i = 1; i <= steps; i++) {
+    int val = start + (delta * i) / steps;
+    analogWrite(pin, constrain(val, 0, 255));
+    delay(stepDelay);
+    if (i == 0) {
+      digitalWrite(pin, LOW);
+    }
+  }
+  analogWrite(pin, target);
+}
 
-  // Main random choice – more realistic mix
-  int choice = random(10);
-  if (choice < 3) {           // 30% breathing (slow open/close)
-    if (random(2) == 0)
-      breathing(LEFT_LED, random(3500, 6500), random(70, 130));
-    else
-      breathing(RIGHT_LED, random(3500, 6500), random(70, 130));
+void fadeBothTo(int target, int duration_ms) {
+  fadeTo(PIN_LEFT_EYE, target, duration_ms);
+  fadeTo(PIN_RIGHT_EYE, target, duration_ms);
+}
+
+void eyesOff() {
+  fadeBothTo(0, inTestMode ? 800 : 1800);
+}
+
+void gentleBreathe() {
+  fadeBothTo(pwmMax, FADE_DURATION_MS);
+  delay(inTestMode ? 400 : SHORT_PAUSE_MS + random(0, 900));
+  fadeBothTo(0, FADE_DURATION_MS + random(-500, 800));
+}
+
+void asymmetricFade() {
+  fadeTo(PIN_LEFT_EYE, pwmMax, FADE_DURATION_MS);
+  delay(450);
+  fadeTo(PIN_RIGHT_EYE, pwmMax, FADE_DURATION_MS + 350);
+  delay(inTestMode ? 500 : 1400 + random(0, 1200));
+  fadeBothTo(0, FADE_DURATION_MS + 700);
+}
+
+void slowWink() {
+  int mainEye = random(2) ? PIN_LEFT_EYE : PIN_RIGHT_EYE;
+  int otherEye = (mainEye == PIN_LEFT_EYE) ? PIN_RIGHT_EYE : PIN_LEFT_EYE;
+
+  fadeTo(mainEye, pwmMax, 2200);
+  delay(900);
+  fadeTo(otherEye, pwmMax * 7 / 10, 1800);
+  delay(1000 + random(0, 1000));
+  fadeTo(mainEye, 0, 1600);
+  fadeTo(otherEye, 0, 2200);
+}
+
+void quickBlinkVariety() {
+  fadeBothTo(pwmMax, 450);
+  delay(200);
+  fadeBothTo(0, 350);
+  delay(500);
+  fadeBothTo(pwmMax, 400);
+  delay(180);
+  fadeBothTo(0, 500);
+}
+
+void doAnimation() {
+  int r = random(10);
+  if (r < 5) gentleBreathe();
+  else if (r < 8) asymmetricFade();
+  else if (r < 9) slowWink();
+  else quickBlinkVariety();
+}
+
+void goToSleep() {
+  // Hard off before sleep (precaution)
+  // analogWrite(PIN_LEFT_EYE,  0);
+  // analogWrite(PIN_RIGHT_EYE, 0);
+  digitalWrite(PIN_LEFT_EYE, LOW);
+  digitalWrite(PIN_RIGHT_EYE, LOW);
+
+  ADCSRA = 0;
+  power_all_disable();
+
+  set_sleep_mode(SLEEP_MODE_PWR_DOWN);
+  sleep_enable();
+
+  noInterrupts();
+  setupWatchdog8s();
+  interrupts();
+
+  sleep_cpu();
+
+  sleep_disable();
+  power_all_enable();
+  ADCSRA = _BV(ADEN) | _BV(ADPS2) | _BV(ADPS1) | _BV(ADPS0);  // /128
+}
+
+void loop() {
+  long vcc_mV = readBattery_mV();
+
+  // Original-style daylight detection
+  int sensorValue = analogRead(PIN_SOLAR);
+  float solarVoltage = sensorValue * (5.0 / 1023.0);
+
+  // Daytime / reset counter
+  if (solarVoltage >= DAYLIGHT_THRESHOLD_V || cycle_counter <= 10) {
+    cycle_counter = MAX_CYCLES;
+
+    // Hard turn-off when light detected (prevents repeated fade flicker)
+    digitalWrite(PIN_LEFT_EYE, LOW);
+    digitalWrite(PIN_RIGHT_EYE, LOW);
+
+    goToSleep();
+    return;
   }
-  else if (choice < 6) {      // 30% single quick blink
-    if (random(2) == 0)
-      quickBlink(LEFT_LED);
-    else
-      quickBlink(RIGHT_LED);
+
+  // Critical low battery
+  if (vcc_mV < CRITICAL_BATTERY_mV) {
+    analogWrite(PIN_LEFT_EYE, 0);
+    analogWrite(PIN_RIGHT_EYE, 0);
+    goToSleep();
+    return;
   }
-  else if (choice < 8) {      // 20% combo
-    combo();
-  }
-  else {                      // 20% both blink
-    bothQuickBlink();
-  }
+
+  // Dim when battery low
+  pwmMax = (vcc_mV < LOW_BATTERY_mV) ? PWM_MAX_LOW : PWM_MAX_NORMAL;
+
+  // Animation when dark
+  doAnimation();
+
+  // Pause between animations
+  int basePause = inTestMode ? 900 : 4000;
+  delay(basePause + random(0, inTestMode ? 2000 : 10000));
+
+  if (!inTestMode) cycle_counter--;
 }
