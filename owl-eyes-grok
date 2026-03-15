@@ -3,7 +3,7 @@
 #include <avr/wdt.h>
 
 // === Uncomment to enable test mode (forces night + very active eyes) ===
-#define TEST_MODE
+// #define TEST_MODE
 
 // Pins
 const byte LEFT_LED  = 1;  // PB1 – physical pin 6 on ATtiny85
@@ -11,10 +11,11 @@ const byte RIGHT_LED = 0;  // PB0 – physical pin 5 on ATtiny85
 const byte LDR_PIN   = A3;
 
 // Settings
-const byte LED_BRIGHTNESS = 255;
-const int NIGHT_THRESHOLD = 400;
-const byte BLINK_CHANCE = 15;
-const int ACTIVE_CYCLES = 1800; // ~4 hours with 8-second cycles
+const byte MAX_BRIGHTNESS = 255;
+const byte NORMAL_BRIGHT  = 100;     // softer for realism
+const int  NIGHT_THRESHOLD = 400;
+const byte BLINK_CHANCE    = 12;     // slightly more frequent than before
+const int  ACTIVE_CYCLES   = 1800;   // ~4 hours
 
 volatile bool watchdogFired = false;
 bool nightStarted = false;
@@ -55,50 +56,76 @@ bool isNight() {
 }
 
 // ────────────────────────────────────────────────
-// Owl eye animations – now end with both LEDs OFF
+// Smooth breathing (eyes "opening up" slowly)
+// durationMs ≈ time for full cycle (fade in + hold + fade out)
 // ────────────────────────────────────────────────
+void breathing(byte pin, int durationMs = 4500, byte peakBright = 110) {
+  analogWrite(pin == LEFT_LED ? RIGHT_LED : LEFT_LED, 0);  // other eye off
 
-void leftEye() {
-  analogWrite(RIGHT_LED, 0);
-  analogWrite(LEFT_LED, LED_BRIGHTNESS);
-  delay(400);
-  analogWrite(LEFT_LED, 0);
-  delay(120);               // short off – looks like a blink
-  analogWrite(LEFT_LED, LED_BRIGHTNESS);
-  delay(400);
-  analogWrite(LEFT_LED, 0); // end off
+  int steps = 60;                    // smooth enough on 8-bit PWM
+  int fadeTime = durationMs / 3;     // ~1/3 fade in, 1/3 hold, 1/3 fade out
+  int stepDelay = fadeTime / steps;
+
+  // Fade in
+  for (int i = 0; i <= steps; i++) {
+    byte b = map(i, 0, steps, 0, peakBright);
+    analogWrite(pin, b);
+    delay(stepDelay);
+  }
+
+  // Hold peak
+  delay(fadeTime);
+
+  // Fade out
+  for (int i = steps; i >= 0; i--) {
+    byte b = map(i, 0, steps, 0, peakBright);
+    analogWrite(pin, b);
+    delay(stepDelay);
+  }
+
+  analogWrite(pin, 0);  // ensure off
 }
 
-void rightEye() {
-  analogWrite(LEFT_LED, 0);
-  analogWrite(RIGHT_LED, LED_BRIGHTNESS);
-  delay(400);
-  analogWrite(RIGHT_LED, 0);
+// Quick single blink (realistic short eyelid close)
+void quickBlink(byte pin, byte bright = NORMAL_BRIGHT) {
+  analogWrite(pin == LEFT_LED ? RIGHT_LED : LEFT_LED, 0); // other off
+
+  analogWrite(pin, bright);
+  delay(80);
+  analogWrite(pin, 0);
   delay(120);
-  analogWrite(RIGHT_LED, LED_BRIGHTNESS);
-  delay(400);
-  analogWrite(RIGHT_LED, 0); // end off
+  analogWrite(pin, bright);
+  delay(200);
+  analogWrite(pin, 0);  // end off
 }
 
-void bothBlink() {
+// Synchronized blink (both eyes)
+void bothQuickBlink() {
   analogWrite(LEFT_LED, 0);
   analogWrite(RIGHT_LED, 0);
-  delay(300);
-  analogWrite(LEFT_LED, LED_BRIGHTNESS);
-  analogWrite(RIGHT_LED, LED_BRIGHTNESS);
-  delay(400);
+  delay(100);
+
+  analogWrite(LEFT_LED, NORMAL_BRIGHT);
+  analogWrite(RIGHT_LED, NORMAL_BRIGHT);
+  delay(150);
   analogWrite(LEFT_LED, 0);
-  analogWrite(RIGHT_LED, 0); // end off
+  analogWrite(RIGHT_LED, 0);
 }
 
+// Combo with mix of blinks & breathing
 void combo() {
-  switch (random(6)) {
-    case 0: leftEye(); delay(300); rightEye(); break;
-    case 1: rightEye(); delay(300); leftEye(); break;
-    case 2: rightEye(); delay(200); bothBlink(); break;
-    case 3: leftEye(); delay(200); bothBlink(); break;
-    case 4: bothBlink(); delay(400); bothBlink(); break;
-    case 5: leftEye(); delay(300); rightEye(); delay(300); bothBlink(); break;
+  int r = random(5);
+  if (r == 0) {
+    breathing(LEFT_LED,  random(3000, 6000));
+  } else if (r == 1) {
+    breathing(RIGHT_LED, random(3000, 6000));
+  } else if (r == 2) {
+    quickBlink(LEFT_LED); delay(400); quickBlink(RIGHT_LED);
+  } else if (r == 3) {
+    quickBlink(RIGHT_LED); delay(300); bothQuickBlink();
+  } else {
+    breathing(LEFT_LED, 3500, 90); delay(600);
+    breathing(RIGHT_LED, 4000, 100);
   }
 }
 
@@ -107,26 +134,24 @@ void setup() {
   pinMode(RIGHT_LED, OUTPUT);
   pinMode(LDR_PIN, INPUT);
 
-  randomSeed(analogRead(2));  // noise from unconnected pin
+  randomSeed(analogRead(2));
 
   setupWatchdog();
 
-  // Startup flash – both eyes full bright for 3 seconds
-  analogWrite(LEFT_LED, 255);
-  analogWrite(RIGHT_LED, 255);
-  delay(3000);
+  // Gentle startup – slow both-eye breath
+  breathing(LEFT_LED,  3000, 180);
+  breathing(RIGHT_LED, 3200, 180);
   analogWrite(LEFT_LED, 0);
   analogWrite(RIGHT_LED, 0);
+  delay(800);
 
 #ifdef TEST_MODE
-  // Extra lively startup in test mode
-  delay(600);
-  leftEye();
+  // Quick demo in test mode
+  breathing(LEFT_LED, 4000);
   delay(800);
-  rightEye();
+  quickBlink(RIGHT_LED);
   delay(800);
   combo();
-  delay(1200);
 #endif
 }
 
@@ -135,23 +160,18 @@ void loop() {
 
   bool night = isNight();
 
-  // Detect start of night
   if (night && !nightStarted) {
     nightStarted = true;
     nightCounter = 0;
 
 #ifdef TEST_MODE
-    // Immediate lively sequence when night "starts" in test mode
     combo();
-    delay(600);
-    leftEye();
-    delay(600);
-    bothBlink();
+    delay(800);
+    breathing(RIGHT_LED, 3800);
     delay(1000);
 #endif
   }
 
-  // Reset during day
   if (!night) {
     nightStarted = false;
     analogWrite(LEFT_LED, 0);
@@ -159,26 +179,33 @@ void loop() {
     return;
   }
 
-  // Limit activity to first ~4 hours of night
   if (nightCounter > ACTIVE_CYCLES) return;
   nightCounter++;
 
-  // Decide whether to animate this cycle
 #ifdef TEST_MODE
-  if (random(4) != 0) return;   // ~75% chance to animate
+  if (random(3) == 0) return;   // ~66% animate chance → lively
 #else
   if (random(BLINK_CHANCE) != 0) return;
 #endif
 
-  // Choose random animation – slightly biased toward single eyes
-  int r = random(8);
-  if (r == 0) {
+  // Main random choice – more realistic mix
+  int choice = random(10);
+  if (choice < 3) {           // 30% breathing (slow open/close)
+    if (random(2) == 0)
+      breathing(LEFT_LED, random(3500, 6500), random(70, 130));
+    else
+      breathing(RIGHT_LED, random(3500, 6500), random(70, 130));
+  }
+  else if (choice < 6) {      // 30% single quick blink
+    if (random(2) == 0)
+      quickBlink(LEFT_LED);
+    else
+      quickBlink(RIGHT_LED);
+  }
+  else if (choice < 8) {      // 20% combo
     combo();
-  } else if (r <= 3) {
-    leftEye();      // 3/8 chance → more left-eye visibility
-  } else if (r <= 6) {
-    rightEye();     // 3/8 chance
-  } else {
-    bothBlink();    // 1/8 chance
+  }
+  else {                      // 20% both blink
+    bothQuickBlink();
   }
 }
